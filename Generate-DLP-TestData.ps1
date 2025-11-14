@@ -169,35 +169,110 @@ function Write-AsXlsx {
 }
 
 function Write-AsDocx {
-  param($Data, [string]$Path, [string]$Title)
-  try {
-    $word = New-Object -ComObject Word.Application
-  } catch {
-    return $false
+  param(
+    $Data,
+    [string]$Path,
+    [string]$Title
+  )
+
+  # Helper to XML-escape text safely
+  function Escape-Xml {
+    param([string]$Text)
+    if ($null -eq $Text) { return "" }
+    return [System.Security.SecurityElement]::Escape($Text)
   }
+
   try {
-    $word.Visible = $false
-    $doc = $word.Documents.Add()
-    $selection = $word.Selection
-    $selection.Style = "Heading 1"
-    $selection.TypeText($Title)
-    $selection.TypeParagraph()
-    $selection.Style = "Normal"
+    # Ensure destination directory exists
+    $dir = Split-Path -LiteralPath $Path -Parent
+    if (-not (Test-Path -LiteralPath $dir)) {
+      New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+
+    # Create a temp folder to build the DOCX structure
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
+    New-Item -ItemType Directory -Path $tempRoot | Out-Null
+
+    $relsDir  = Join-Path $tempRoot "_rels"
+    $wordDir  = Join-Path $tempRoot "word"
+
+    New-Item -ItemType Directory -Path $relsDir, $wordDir | Out-Null
+
+    # [Content_Types].xml
+    $contentTypesXml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>
+"@
+    Set-Content -Path (Join-Path $tempRoot "[Content_Types].xml") -Value $contentTypesXml -Encoding UTF8
+
+    # _rels/.rels
+    $relsXml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>
+"@
+    Set-Content -Path (Join-Path $relsDir ".rels") -Value $relsXml -Encoding UTF8
+
+    # Build the body content (title + rows)
+    $sb = New-Object System.Text.StringBuilder
+
+    # Title paragraph (simple heading-like paragraph)
+    $null = $sb.AppendLine(
+      "<w:p><w:r><w:t>" + (Escape-Xml $Title) + "</w:t></w:r></w:p>"
+    )
+
+    # Empty line after title
+    $null = $sb.AppendLine("<w:p><w:r><w:t></w:t></w:r></w:p>")
 
     foreach ($row in $Data) {
       foreach ($p in $row.PSObject.Properties) {
-        $selection.TypeText("{0}: {1}" -f $p.Name, $p.Value)
-        $selection.TypeParagraph()
+        $line = "{0}: {1}" -f $p.Name, $p.Value
+        $null = $sb.AppendLine(
+          "<w:p><w:r><w:t>" + (Escape-Xml $line) + "</w:t></w:r></w:p>"
+        )
       }
-      $selection.TypeParagraph()
+      # Blank line between records
+      $null = $sb.AppendLine("<w:p><w:r><w:t></w:t></w:r></w:p>")
     }
 
-    $doc.SaveAs([ref]$Path)
-    $doc.Close()
-    $word.Quit()
+    # Wrap body content into minimal WordprocessingML document
+    $documentXml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+$($sb.ToString())
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"@
+
+    Set-Content -Path (Join-Path $wordDir "document.xml") -Value $documentXml -Encoding UTF8
+
+    # Now zip the structure as a .docx
+    if (Test-Path -LiteralPath $Path) {
+      Remove-Item -LiteralPath $Path -Force
+    }
+
+    # Compress-Archive will zip the *contents* of $tempRoot, not the folder itself
+    $itemsToZip = Get-ChildItem -LiteralPath $tempRoot
+    Compress-Archive -LiteralPath $itemsToZip.FullName -DestinationPath $Path -Force
+
+    # Clean up temp folder
+    Remove-Item -LiteralPath $tempRoot -Recurse -Force
+
     return $true
   } catch {
-    try { if ($doc) { $doc.Close() } if ($word) { $word.Quit() } } catch {}
+    # If anything goes wrong, try to clean up and report failure
+    try {
+      if (Test-Path -LiteralPath $tempRoot) {
+        Remove-Item -LiteralPath $tempRoot -Recurse -Force
+      }
+    } catch {}
     return $false
   }
 }
